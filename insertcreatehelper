@@ -1,0 +1,41 @@
+// main.go
+package main
+
+import (
+	"log"
+	"time"
+)
+
+func main() {
+	// Example of working with Unix timestamps
+	now := time.Now()
+	unixTime := TimeToUnix(now)
+
+	// Creating a record with Unix timestamps
+	record := &Record{
+		Name:          "Test Record",
+		CreatedAtUnix: unixTime,
+		UpdatedAtUnix: &unixTime, // Nullable field
+	}
+
+	// Insert the record
+	if err := InsertRecord(db, record); err != nil {
+		log.Fatalf("Failed to insert record: %v", err)
+	}
+
+	// Retrieve and display the record
+	retrievedRecord, err := GetRecord(db, record.ID)
+	if err != nil {
+		log.Fatalf("Failed to get record: %v", err)
+	}
+
+	// Convert Unix timestamp back to time.Time for display/processing
+	createdTime := UnixToTime(retrievedRecord.CreatedAtUnix)
+	var updatedTime time.Time
+	if retrievedRecord.UpdatedAtUnix != nil {
+		updatedTime = UnixToTime(*retrievedRecord.UpdatedAtUnix)
+	}
+
+	log.Printf("Created at: %v", createdTime)
+	log.Printf("Updated at: %v", updatedTime)
+}
