@@ -1,0 +1,116 @@
+package main
+
+import (
+	"database/sql"
+	"fmt"
+	"log"
+
+	_ "github.com/lib/pq"
+)
+
+// fetch all accounts from a given table
+func fetchAccounts(db *sql.DB, tableName string) ([]string, error) {
+	query := fmt.Sprintf("SELECT account_name FROM %s", tableName)
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var accounts []string
+	for rows.Next() {
+		var account string
+		if err := rows.Scan(&account); err != nil {
+			return nil, err
+		}
+		accounts = append(accounts, account)
+	}
+	return accounts, nil
+}
+
+// filter vault accounts dynamically
+func filterVaultAccounts(db *sql.DB, searchTerm string) error {
+	_, err := db.Exec(`CREATE TEMP TABLE filtered_vault AS 
+		SELECT * FROM vault_accounts WHERE account_name ILIKE $1`, "%"+searchTerm+"%")
+	return err
+}
+
+// ensure platform-specific comparison tables exist
+func createComparisonTables(db *sql.DB, platform string) error {
+	query := fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS not_vaulted_%s (
+			account_name TEXT PRIMARY KEY
+		);
+		CREATE TABLE IF NOT EXISTS orphaned_%s (
+			account_name TEXT PRIMARY KEY
+		);
+	`, platform, platform)
+
+	_, err := db.Exec(query)
+	return err
+}
+
+// insert accounts that are in the platform (AD, Linux, etc.) but not in the vault
+func insertNotVaulted(db *sql.DB, platform string) error {
+	query := fmt.Sprintf(`
+		INSERT INTO not_vaulted_%s (account_name)
+		SELECT p.account_name
+		FROM %s_accounts p
+		LEFT JOIN filtered_vault v ON p.account_name = v.account_name
+		WHERE v.account_name IS NULL
+	`, platform, platform)
+
+	_, err := db.Exec(query)
+	return err
+}
+
+// insert orphaned accounts (found on the endpoint but not in the vault)
+func insertOrphaned(db *sql.DB, platform string) error {
+	query := fmt.Sprintf(`
+		INSERT INTO orphaned_%s (account_name)
+		SELECT e.account_name
+		FROM %s_endpoints e
+		LEFT JOIN filtered_vault v ON e.account_name = v.account_name
+		WHERE v.account_name IS NULL
+	`, platform, platform)
+
+	_, err := db.Exec(query)
+	return err
+}
+
+// run full comparison process for a platform
+func runComparisonForPlatform(db *sql.DB, platform, searchTerm string) error {
+	if err := createComparisonTables(db, platform); err != nil {
+		return err
+	}
+	if err := filterVaultAccounts(db, searchTerm); err != nil {
+		return err
+	}
+	if err := insertNotVaulted(db, platform); err != nil {
+		return err
+	}
+	if err := insertOrphaned(db, platform); err != nil {
+		return err
+	}
+	return nil
+}
+
+func main() {
+	connStr := "user=youruser dbname=yourdb sslmode=disable"
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	platforms := []string{"ad", "linux"} // add more as needed
+	searchTerm := "admin"                // example filter
+
+	for _, platform := range platforms {
+		if err := runComparisonForPlatform(db, platform, searchTerm); err != nil {
+			log.Fatalf("error processing %s: %v", platform, err)
+		}
+	}
+
+	fmt.Println("Comparison process completed successfully for all platforms.")
+}
