@@ -1,0 +1,202 @@
+package db
+
+import (
+	"database/sql"
+	"testing"
+
+	_ "github.com/mattn/go-sqlite3"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// TestAccount represents an account for testing
+type TestAccount struct {
+	AccountID   string
+	AccountName string
+	Platform    string
+}
+
+func setupTestDB(t *testing.T) *sql.DB {
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+
+	// Create tables for testing
+	_, err = db.Exec(`
+        CREATE TABLE IF NOT EXISTS vault_accounts (
+            account_id TEXT,
+            account_name TEXT,
+            platform TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS ad_accounts (
+            account_id TEXT,
+            account_name TEXT,
+            platform TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS account_discrepancy_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform TEXT,
+            discrepancy_type TEXT,
+            account_id TEXT,
+            account_name TEXT,
+            first_detected TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_resolved BOOLEAN DEFAULT FALSE,
+            resolved_at TIMESTAMP
+        );
+    `)
+	require.NoError(t, err)
+
+	return db
+}
+
+// Helper functions to populate test data
+func insertVaultAccount(t *testing.T, db *sql.DB, acc TestAccount) {
+	_, err := db.Exec(
+		"INSERT INTO vault_accounts (account_id, account_name, platform) VALUES (?, ?, ?)",
+		acc.AccountID, acc.AccountName, acc.Platform,
+	)
+	require.NoError(t, err)
+}
+
+func insertADAccount(t *testing.T, db *sql.DB, acc TestAccount) {
+	_, err := db.Exec(
+		"INSERT INTO ad_accounts (account_id, account_name, platform) VALUES (?, ?, ?)",
+		acc.AccountID, acc.AccountName, acc.Platform,
+	)
+	require.NoError(t, err)
+}
+
+func TestAccountComparison(t *testing.T) {
+	t.Run("Detects not vaulted account", func(t *testing.T) {
+		db := setupTestDB(t)
+		defer db.Close()
+
+		// Setup: Account in AD but not in vault
+		adAcc := TestAccount{
+			AccountID:   "test1",
+			AccountName: "testuser1",
+			Platform:    "azure",
+		}
+		insertADAccount(t, db, adAcc)
+
+		// Run comparison
+		comparer := NewAccountComparer(db)
+		result, err := comparer.CompareAccounts(adAcc.Platform)
+		require.NoError(t, err)
+
+		// Check results
+		var count int
+		err = db.QueryRow("SELECT COUNT(*) FROM account_discrepancy_history WHERE account_id = ? AND discrepancy_type = 'not_vaulted'", adAcc.AccountID).Scan(&count)
+		require.NoError(t, err)
+		assert.Equal(t, 1, count)
+	})
+
+	t.Run("Detects orphaned account", func(t *testing.T) {
+		db := setupTestDB(t)
+		defer db.Close()
+
+		// Setup: Account in vault but not in AD
+		vaultAcc := TestAccount{
+			AccountID:   "test2",
+			AccountName: "testuser2",
+			Platform:    "azure",
+		}
+		insertVaultAccount(t, db, vaultAcc)
+
+		// Run comparison
+		comparer := NewAccountComparer(db)
+		result, err := comparer.CompareAccounts(vaultAcc.Platform)
+		require.NoError(t, err)
+
+		// Check results
+		var count int
+		err = db.QueryRow("SELECT COUNT(*) FROM account_discrepancy_history WHERE account_id = ? AND discrepancy_type = 'orphaned'", vaultAcc.AccountID).Scan(&count)
+		require.NoError(t, err)
+		assert.Equal(t, 1, count)
+	})
+
+	t.Run("Resolves fixed discrepancy", func(t *testing.T) {
+		db := setupTestDB(t)
+		defer db.Close()
+
+		// Setup: Create initial discrepancy
+		acc := TestAccount{
+			AccountID:   "test3",
+			AccountName: "testuser3",
+			Platform:    "azure",
+		}
+
+		// Insert into AD only first
+		insertADAccount(t, db, acc)
+
+		comparer := NewAccountComparer(db)
+		_, err := comparer.CompareAccounts(acc.Platform)
+		require.NoError(t, err)
+
+		// Now "fix" by adding to vault
+		insertVaultAccount(t, db, acc)
+
+		// Run comparison again
+		_, err = comparer.CompareAccounts(acc.Platform)
+		require.NoError(t, err)
+
+		// Check that the issue is resolved
+		var isResolved bool
+		var resolvedAt sql.NullTime
+		err = db.QueryRow(
+			"SELECT is_resolved, resolved_at FROM account_discrepancy_history WHERE account_id = ?",
+			acc.AccountID,
+		).Scan(&isResolved, &resolvedAt)
+		require.NoError(t, err)
+		assert.True(t, isResolved)
+		assert.True(t, resolvedAt.Valid)
+	})
+
+	t.Run("Handles reappearing discrepancy", func(t *testing.T) {
+		db := setupTestDB(t)
+		defer db.Close()
+
+		acc := TestAccount{
+			AccountID:   "test4",
+			AccountName: "testuser4",
+			Platform:    "azure",
+		}
+
+		// First appearance: in AD but not vault
+		insertADAccount(t, db, acc)
+
+		comparer := NewAccountComparer(db)
+		_, err := comparer.CompareAccounts(acc.Platform)
+		require.NoError(t, err)
+
+		// Fix it
+		insertVaultAccount(t, db, acc)
+		_, err = comparer.CompareAccounts(acc.Platform)
+		require.NoError(t, err)
+
+		// Make it reappear by removing from vault
+		_, err = db.Exec("DELETE FROM vault_accounts WHERE account_id = ?", acc.AccountID)
+		require.NoError(t, err)
+
+		// Run comparison again
+		_, err = comparer.CompareAccounts(acc.Platform)
+		require.NoError(t, err)
+
+		// Should have two entries: one resolved, one current
+		var count int
+		err = db.QueryRow("SELECT COUNT(*) FROM account_discrepancy_history WHERE account_id = ?", acc.AccountID).Scan(&count)
+		require.NoError(t, err)
+		assert.Equal(t, 2, count)
+
+		// Verify latest is not resolved
+		var isResolved bool
+		err = db.QueryRow(
+			"SELECT is_resolved FROM account_discrepancy_history WHERE account_id = ? ORDER BY first_detected DESC LIMIT 1",
+			acc.AccountID,
+		).Scan(&isResolved)
+		require.NoError(t, err)
+		assert.False(t, isResolved)
+	})
+}
